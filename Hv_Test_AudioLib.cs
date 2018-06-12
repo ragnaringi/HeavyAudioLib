@@ -31,6 +31,7 @@
  */
 
 using System;
+using System.IO;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using UnityEngine;
@@ -160,8 +161,110 @@ class Hv_Test_Context {
   private readonly IntPtr _context; // handle into unmanaged memory
   private SendHook _sendHook = null;
 
+#if UNITY_EDITOR
+ 
+	private IntPtr libraryHandle; // Handle to the C++ DLL
+
+	private delegate IntPtr HvNewWithOptionsDelegate(double sampleRate, int poolKb, int inQueueKb, int outQueueKb);
+	private HvNewWithOptionsDelegate hv_Test_new_with_options;
+
+#endif
+
+#if UNITY_EDITOR_OSX || UNITY_EDITOR_LINUX
+ 
+	[DllImport("__Internal")]
+	private static extern IntPtr dlopen(
+		string path,
+		int flag);
+ 
+	[DllImport("__Internal")]
+	private static extern IntPtr dlsym(
+		IntPtr handle,
+		string symbolName);
+ 
+	[DllImport("__Internal")]
+	private static extern int dlclose(
+		IntPtr handle);
+ 
+	private static IntPtr OpenLibrary(string path)
+	{
+		IntPtr handle = dlopen(path, 0);
+		if (handle == IntPtr.Zero)
+		{
+			throw new Exception("Couldn't open native library: " + path);
+		}
+		return handle;
+	}
+ 
+	private static void CloseLibrary(IntPtr libraryHandle)
+	{
+		dlclose(libraryHandle);
+	}
+ 
+	private static T GetDelegate<T>(
+		IntPtr libraryHandle,
+		string functionName) where T : class
+	{
+		IntPtr symbol = dlsym(libraryHandle, functionName);
+		if (symbol == IntPtr.Zero)
+		{
+			throw new Exception("Couldn't get function: " + functionName);
+		}
+		return Marshal.GetDelegateForFunctionPointer(
+			symbol,
+			typeof(T)) as T;
+	}
+  
+#elif UNITY_EDITOR_WIN
+ 
+	[DllImport("kernel32")]
+	private static extern IntPtr LoadLibrary(
+		string path);
+ 
+	[DllImport("kernel32")]
+	private static extern IntPtr GetProcAddress(
+		IntPtr libraryHandle,
+		string symbolName);
+ 
+	[DllImport("kernel32")]
+	private static extern bool FreeLibrary(
+		IntPtr libraryHandle);
+ 
+	private static IntPtr OpenLibrary(string path)
+	{
+		IntPtr handle = LoadLibrary(path);
+		if (handle == IntPtr.Zero)
+		{
+			throw new Exception("Couldn't open native library: " + path);
+		}
+		return handle;
+	}
+ 
+	private static void CloseLibrary(IntPtr libraryHandle)
+	{
+		FreeLibrary(libraryHandle);
+	}
+ 
+	private static T GetDelegate<T>(
+		IntPtr libraryHandle,
+		string functionName) where T : class
+	{
+		IntPtr symbol = GetProcAddress(libraryHandle, functionName);
+		if (symbol == IntPtr.Zero)
+		{
+			throw new Exception("Couldn't get function: " + functionName);
+		}
+		return Marshal.GetDelegateForFunctionPointer(
+			symbol,
+			typeof(T)) as T;
+	}
+ 
+#else
+
   [DllImport (_dllName)]
   private static extern IntPtr hv_Test_new_with_options(double sampleRate, int poolKb, int inQueueKb, int outQueueKb);
+
+#endif
 
   [DllImport (_dllName)]
   private static extern int hv_processInlineInterleaved(IntPtr ctx,
@@ -224,6 +327,24 @@ class Hv_Test_Context {
 
   public Hv_Test_Context(double sampleRate, int poolKb=10, int inQueueKb=2, int outQueueKb=2) {
     gch = GCHandle.Alloc(msgQueue);
+#if UNITY_EDITOR
+    string scriptPath = System.IO.Directory.GetFiles(Application.dataPath, "Hv_Test_AudioLib.cs", SearchOption.AllDirectories)[0];
+    string directory = Path.GetDirectoryName(scriptPath);
+
+#if UNITY_EDITOR_OSX
+	  string LIB_PATH = Path.Combine(directory, "Hv_Test_Audiolib.bundle/Contents/MacOS/Hv_Test_Audiolib");
+#elif UNITY_EDITOR_LINUX
+	  string LIB_PATH = Path.Combine(directory, "Hv_Test_Audiolib.so");
+#elif UNITY_EDITOR_WIN
+	  string LIB_PATH = Path.Combine(directory, "Hv_Test_Audiolib.dll");
+#endif
+
+		libraryHandle = OpenLibrary(LIB_PATH);
+		hv_Test_new_with_options = GetDelegate<HvNewWithOptionsDelegate>(
+			libraryHandle,
+			"hv_Test_new_with_options"
+		);
+#endif
     _context = hv_Test_new_with_options(sampleRate, poolKb, inQueueKb, outQueueKb);
     hv_setPrintHook(_context, new PrintHook(OnPrint));
     hv_setUserData(_context, GCHandle.ToIntPtr(gch));
@@ -234,6 +355,10 @@ class Hv_Test_Context {
     GC.KeepAlive(_context);
     GC.KeepAlive(_sendHook);
     gch.Free();
+#if UNITY_EDITOR
+		CloseLibrary(libraryHandle);
+		libraryHandle = IntPtr.Zero;
+#endif
   }
 
   public void RegisterSendHook() {
